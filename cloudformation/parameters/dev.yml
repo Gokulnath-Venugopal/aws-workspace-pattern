@@ -1,0 +1,32 @@
+---
+# VPC
+Octet: "100"
+
+# AD
+ActiveDirectoryDomainName: "pattern-library.example.com"
+
+# FsX (File system. If FsX filesystem is used, then workspace image needs a scirpt to mount the FsX on each logon, which is documented)
+# Note : For SSD storage, valid values are 32 GiB-65,536 GiB (64 TiB).
+WindowsFileShare : "false"
+StorageCapacity: "100"
+ThroughputCapacity: "32" # Refer the documentation to update the throughput capacity. (https://docs.aws.amazon.com/fsx/latest/WindowsGuide/performance.html)
+
+# VPN Connection (Creates TransitGateway)
+VPNConnection: "false"
+OnPremiseVPNTerminationIP: "1.1.1.1"
+OnPremiseCIDR: "172.16.0.0/16"
+
+# Workspace # Pre-created workspace image bundle id or standing image bundle id's offered by AWS.
+BundleId: "wsb-gk1wpk43z"
+
+# Provide unrestricted interet access to workspace.
+UnlimitedInternetAccesstoWorkspace: "true"
+
+# Restrict outbound internet access. Allow access to selected IP's.
+RestrictedInternetAccesstoWorkspace: "false"
+CustomIPAddress1: "1.2.3.4/32"
+CustomIPAddress2: "1.3.4.5/32"
+
+# Cost Allocation Tags
+BusinessGroup: "Cevo"
+CostCenter: "LibraryPattern"

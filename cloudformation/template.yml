@@ -1,0 +1,949 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  The template provisions a VPC + Managed Active Directory Service and AWS Workspace amd FsX FileSysem + Managed VPN Connection to on-premise
+  Change History
+  Adding FSx (windows file server) - Reason for chooing. low cost, Minimum 132GB and fits for purpose. (has only SMB file share)
+  FsX integrated with AD
+  Workspace with custom script installed to mount FsX on each login using task-scheduler & powershell script
+  Workspace and FSx & VPC deployed using one single cloudformation
+  Register the Domain in Workspaces before deploying cloudformation template
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: VPC Parameters
+        Parameters:
+          - Octet
+Parameters:
+  Octet:
+    Description: 3nd Octet (10.XXX.16.0/21) # Choose the VPC CIDR based on customer need.
+    Type: Number
+    ConstraintDescription: Entry must fall between 0 and 255
+    MinValue: 0
+    MaxValue: 255
+    Default: 100
+  ActiveDirectoryDomainName:
+    AllowedPattern: '[a-zA-Z0-9\-]+\..+'
+    Description: Specify the fully qualified domain name (FQDN) of your self-managed directory. (Example - workspace.labx.com)
+    Type: String
+    Default: pattern-library.example.com
+  WindowsFileShare: 
+    Description: Do you want Windows FileShare for workspace?
+    Default: false
+    Type: String
+    AllowedValues: 
+      - true
+      - false
+    ConstraintDescription: Must specify true or false.
+  StorageCapacity:
+    Description: Specify the storage capacity of the file system being created, in gibibytes. 
+      Valid values are 32 GiB - 65,536 GiB. Consider choosing a higher value for greater capacity.
+    Type: Number
+    Default: 100
+  ThroughputCapacity:
+    Description: The throughput capacity of FSx File system mounted to Workspaces.
+    Type: Number
+    Default: 32
+  CostCenter:
+    Description: The Business Group to which the cost needs to be allocated.
+    Type: String
+    Default: 'PatternLibrary'
+  BusinessGroup:
+    Description: The personnel in the Business Group for whom the solution is built.
+    Type: String
+    Default: 'BureauOperators'
+  BundleId:
+    Description: Workspace Version 3 Bundle
+    Type: String
+    Default: 'wsb-gk1wpk43z'
+  VPNConnection: 
+    Description: Need a Managed VPN connection to on-premise? (optional).
+    Default: false
+    Type: String
+    AllowedValues: 
+      - true
+      - false
+    ConstraintDescription: Must specify True or False.
+  OnPremiseVPNTerminationIP:
+    Description: The IP address for your on premises VPN termination device
+    Type: String
+    Default: '116.212.228.74'
+  OnPremiseCIDR:
+    Description: The IP range of on premises.
+    Type: String
+    Default: '1.1.1.1/32'    
+# Internet access to workspace.
+  UnlimitedInternetAccesstoWorkspace: 
+    Description: Do you want unrestricted internet access to workspace?
+    Default: false
+    Type: String
+    AllowedValues: 
+      - true
+      - false
+    ConstraintDescription: Must specify true or false.
+  RestrictedInternetAccesstoWorkspace:
+    Description: Restriscted Internet Connection.
+    Default: false
+    Type: String
+    AllowedValues: 
+      - true
+      - false
+    ConstraintDescription: Must specify True or False.
+  CustomIPAddress1:
+    Description: Example, external IP A.
+    Type: String
+    Default: '1.1.1.1/32'
+  CustomIPAddress2:
+    Description: Example, external IP B.
+    Type: String
+    Default: '2.2.2.2/32'
+Mappings:
+  RegionMap:
+    us-east-1:
+      az1: use1-az2
+      az2: use1-az4
+      az3: use1-az6
+    us-west-2:
+      az1: usw2-az1
+      az2: usw2-az2
+      az3: usw2-az3
+    ap-south-1:
+      az1: aps1-az1
+      az2: aps1-az2
+      az3: aps1-az3
+    ap-northeast-2:
+      az1: apne2-az1
+      az2: apne2-az3
+    ap-southeast-1:
+      az1: apse1-az1
+      az2: apse1-az2
+    ap-southeast-2:
+      az1: apse2-az1
+      az2: apse2-az3
+    ap-northeast-1:
+      az1: apne1-az1
+      az2: apne1-az4
+    ca-central-1:
+      az1: cac1-az1
+      az2: cac1-az2
+    eu-central-1:
+      az1: euc1-az2
+      az2: euc1-az3
+    eu-west-1:
+      az1: euw1-az1
+      az2: euw1-az2
+    eu-west-2:
+      az1: euw2-az2
+      az2: euw2-az3
+    sa-east-1:
+      az1: sae1-az1
+      az2: sae1-az3
+Conditions: 
+  CreateInternetAccesstoWorkspace : !Equals
+    - !Ref UnlimitedInternetAccesstoWorkspace
+    - true
+  CreateCustomIPWhitelisting : !Equals
+    - !Ref RestrictedInternetAccesstoWorkspace
+    - true
+  CreateVPNConnection: !Equals
+    - !Ref VPNConnection
+    - true
+  CreateWindowsFileShare: !Equals
+    - !Ref WindowsFileShare
+    - true
+Resources:
+  iamLambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: >-
+              The Amazon EC2 ec2:Describe* API actions do not support
+              resource-level permissions
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: describe-ec2-az
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeAvailabilityZones'
+                Resource: '*'
+      MaxSessionDuration: 3600
+      Path: /service-role/
+      Tags:
+        - Key: Name
+          Value: LambdaRole
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+  fnZoneIdtoZoneName:
+    Type: 'AWS::Lambda::Function'
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >-
+              This function is used to determine which AZs to deploy the subnets
+              in.
+          - id: W92
+            reason: This function only runs twice to select private subnets.
+    Properties:
+      Runtime: python3.8
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          def zoneId_to_zoneName(event, context):
+              responseData = {}
+              ec2 = boto3.client('ec2')
+              describe_az = ec2.describe_availability_zones()
+              for az in describe_az['AvailabilityZones']:
+                  if event['ResourceProperties']['ZoneId'] == az['ZoneId']:
+                      responseData['ZoneName'] = az['ZoneName']
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, str(az['ZoneId']))           
+          def no_op(event, context):
+              print(event)
+              responseData = {}
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, str(event['RequestId']))
+          def lambda_handler(event, context):
+              if event['RequestType'] == ('Create' or 'Update'):
+                  zoneId_to_zoneName(event, context)
+              else:
+                  no_op(event,context)
+      Role: !GetAtt iamLambdaExecutionRole.Arn
+      Tags:
+        - Key: Name
+          Value: LambdaFunction
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+  getAZ1:
+    Type: 'Custom::zone-id-zone-name'
+    Properties:
+      ServiceToken: !GetAtt fnZoneIdtoZoneName.Arn
+      ZoneId: !FindInMap
+        - RegionMap
+        - !Ref 'AWS::Region'
+        - az1
+  getAZ2:
+    Type: 'Custom::zone-id-zone-name'
+    Properties:
+      ServiceToken: !GetAtt fnZoneIdtoZoneName.Arn
+      ZoneId: !FindInMap
+        - RegionMap
+        - !Ref 'AWS::Region'
+        - az2
+  WorkSpacesVPC:
+    Type: 'AWS::EC2::VPC'
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W60
+            reason: 'VPC flow logs not enabled'
+    Properties:
+      CidrBlock: !Sub '10.${Octet}.16.0/21'
+      Tags:
+        - Key: Name
+          Value: WorkspaceVPC
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+  VPCFlowLogRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'vpc-flow-logs.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: 'WorkspaceVPC-flowlogs-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                Resource: !GetAtt 'VPCFlowLogGroup.Arn'
+  VPCFlowLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: WorkspaceVPCLogGroup
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+  VPCFlowLog:
+    Type: 'AWS::EC2::FlowLog'
+    Properties:
+      DeliverLogsPermissionArn: !GetAtt 'VPCFlowLogRole.Arn'
+      LogGroupName: !Ref 'VPCFlowLogGroup'
+      ResourceId: !Ref 'WorkSpacesVPC'
+      ResourceType: 'VPC'
+      TrafficType: ALL
+      Tags:
+        - Key: Name
+          Value: WorkspaceVPCLogGroup
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+  PublicSubnet1:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref WorkSpacesVPC
+      AvailabilityZone: !GetAtt getAZ1.ZoneName
+      CidrBlock: !Sub '10.${Octet}.16.0/24'
+      Tags:
+        - Key: Name
+          Value: PublicSubnet1
+        - Key: Network
+          Value: Public
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+  PublicSubnet2:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref WorkSpacesVPC
+      AvailabilityZone: !GetAtt getAZ2.ZoneName
+      CidrBlock: !Sub '10.${Octet}.17.0/24'
+      Tags:
+        - Key: Name
+          Value: PublicSubnet2
+        - Key: Network
+          Value: Public
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+  PrivateSubnet1:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref WorkSpacesVPC
+      AvailabilityZone: !GetAtt getAZ1.ZoneName
+      CidrBlock: !Sub '10.${Octet}.20.0/23'
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: PrivateSubnet1
+        - Key: Network
+          Value: Private
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+  PrivateSubnet2:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref WorkSpacesVPC
+      AvailabilityZone: !GetAtt getAZ2.ZoneName
+      CidrBlock: !Sub '10.${Octet}.22.0/23'
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: PrivateSubnet2
+        - Key: Network
+          Value: Private
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+  PrivateNetworkAcl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId:
+        Ref: WorkSpacesVPC
+      Tags:
+        - Key: Name
+          Value: WorkspacePrivateNACL
+        - Key: Network
+          Value: Private
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+  PublicNetworkAcl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId:
+        Ref: WorkSpacesVPC
+      Tags:
+        - Key: Name
+          Value: WorkspacePublicNACL
+        - Key: Network
+          Value: Public
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+  PrivateSubnetNetworkAclAssociation1:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId:
+        Ref: PrivateSubnet1
+      NetworkAclId:
+        Ref: PrivateNetworkAcl
+  PrivateSubnetNetworkAclAssociation2:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId:
+        Ref: PrivateSubnet2
+      NetworkAclId:
+        Ref: PrivateNetworkAcl
+  PublicSubnetNetworkAclAssociation1:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId:
+        Ref: PublicSubnet1
+      NetworkAclId:
+        Ref: PublicNetworkAcl
+  PublicSubnetNetworkAclAssociation2:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId:
+        Ref: PublicSubnet2
+      NetworkAclId:
+        Ref: PublicNetworkAcl
+  PrivateNACLInboundRule:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId:
+        Ref: PrivateNetworkAcl
+      RuleNumber: 100
+      Protocol: -1
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+  PublicNACLInboundRule:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId:
+        Ref: PublicNetworkAcl
+      RuleNumber: 100
+      Protocol: -1
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+  PublicNACLOutboundRule:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId:
+        Ref: PublicNetworkAcl
+      RuleNumber: 100
+      Protocol: -1
+      Egress: true
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+  PrivateNACLOutboundRule:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId:
+        Ref: PrivateNetworkAcl
+      RuleNumber: 100
+      Protocol: -1
+      Egress: true
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    Properties:
+      Tags:
+        - Key: Name
+          Value: WorkspaceInternetGateway
+        - Key: Network
+          Value: Private
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+  GatewayToInternet:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref WorkSpacesVPC
+      InternetGatewayId: !Ref InternetGateway
+  PublicRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref WorkSpacesVPC
+      Tags:
+        - Key: Name
+          Value: PublicSubnetRouteTable
+        - Key: Network
+          Value: Public
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+  PublicRoute:
+    Type: 'AWS::EC2::Route'
+    DependsOn: GatewayToInternet
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnet1RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnet2RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+  NatGateway:
+    Type: 'AWS::EC2::NatGateway'
+    Properties:
+      AllocationId: !GetAtt NatPublicIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: WorkspaceNATGateway
+        - Key: Network
+          Value: Private
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+  NatPublicIP:
+    Type: 'AWS::EC2::EIP'
+    DependsOn: WorkSpacesVPC
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: NATGatewayElasticIP
+        - Key: Network
+          Value: Private
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+  PrivateRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref WorkSpacesVPC
+      Tags:
+        - Key: Name
+          Value: PrivateSubnetRouteTable
+        - Key: Network
+          Value: Private
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+  PrivateSubnet1RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+  PrivateSubnet2RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+  ADAdminSecret:
+    Type: 'AWS::SecretsManager::Secret'
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W77
+            reason: KMS key not specified explicitly
+    Properties:
+      Name: ADAdminSecret
+      Description: Password for directory services admin
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "Admin"}'
+        GenerateStringKey: password
+        PasswordLength: 30
+        ExcludeCharacters: '"@/\'
+      Tags:
+        - Key: Name
+          Value: MicrosoftADAdminSecret
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+  ManagedAD:
+    Type: 'AWS::DirectoryService::MicrosoftAD'
+    Properties:
+      Edition: Standard
+      Name: !Ref ActiveDirectoryDomainName
+      Password: '{{resolve:secretsmanager:ADAdminSecret:SecretString:password}}'
+      ShortName: workspaces
+      VpcSettings:
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        VpcId: !Ref WorkSpacesVPC
+  FSxKMSKey:
+    Condition: CreateWindowsFileShare
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::KMS::Key
+    Properties:
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: !Ref AWS::StackName
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:CreateGrant'
+              - 'kms:ListGrants'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub 'fsx.${AWS::Region}.amazonaws.com'
+                kms:CallerAccount: !Sub '${AWS::AccountId}'
+      Tags:
+        - Key: Name
+          Value: FSxKMSKey
+        - Key: Network
+          Value: Private
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+  FSxKeyAlias:
+    Condition: CreateWindowsFileShare
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${AWS::StackName}"
+      TargetKeyId: !Ref FSxKMSKey
+  FSxSecurityGroup:
+    Condition: CreateWindowsFileShare
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref WorkSpacesVPC
+      GroupDescription: Security Group for FSx for Windows File Storage Access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Sub '10.${Octet}.16.0/21'
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Sub '10.${Octet}.16.0/21'
+        - IpProtocol: tcp
+          FromPort: 88
+          ToPort: 88
+          CidrIp: !Sub '10.${Octet}.16.0/21'
+        - IpProtocol: udp
+          FromPort: 88
+          ToPort: 88
+          CidrIp: !Sub '10.${Octet}.16.0/21'
+        - IpProtocol: udp
+          FromPort: 123
+          ToPort: 123
+          CidrIp: !Sub '10.${Octet}.16.0/21'
+        - IpProtocol: tcp
+          FromPort: 135
+          ToPort: 135
+          CidrIp: !Sub '10.${Octet}.16.0/21'
+        - IpProtocol: udp
+          FromPort: 389
+          ToPort: 389
+          CidrIp: !Sub '10.${Octet}.16.0/21'
+        - IpProtocol: tcp
+          FromPort: 389
+          ToPort: 389
+          CidrIp: !Sub '10.${Octet}.16.0/21'
+        - IpProtocol: udp
+          FromPort: 445
+          ToPort: 445
+          CidrIp: !Sub '10.${Octet}.16.0/21'
+        - IpProtocol: tcp
+          FromPort: 445
+          ToPort: 445
+          CidrIp: !Sub '10.${Octet}.16.0/21'
+        - IpProtocol: udp
+          FromPort: 464
+          ToPort: 464
+          CidrIp: !Sub '10.${Octet}.16.0/21'
+        - IpProtocol: tcp
+          FromPort: 464
+          ToPort: 464
+          CidrIp: !Sub '10.${Octet}.16.0/21'
+        - IpProtocol: tcp
+          FromPort: 636
+          ToPort: 636
+          CidrIp: !Sub '10.${Octet}.16.0/21'
+        - IpProtocol: tcp
+          FromPort: 3268
+          ToPort: 3268
+          CidrIp: !Sub '10.${Octet}.16.0/21'
+        - IpProtocol: tcp
+          FromPort: 3269
+          ToPort: 3269
+          CidrIp: !Sub '10.${Octet}.16.0/21'
+        - IpProtocol: tcp
+          FromPort: 5985
+          ToPort: 5985
+          CidrIp: !Sub '10.${Octet}.16.0/21'
+        - IpProtocol: tcp
+          FromPort: 9389
+          ToPort: 9389
+          CidrIp: !Sub '10.${Octet}.16.0/21'
+        - IpProtocol: tcp
+          FromPort: 49152
+          ToPort: 65535
+          CidrIp: !Sub '10.${Octet}.16.0/21'
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: !Sub '10.${Octet}.16.0/21'
+  WindowsFSx:
+    Condition: CreateWindowsFileShare
+    Type: 'AWS::FSx::FileSystem'
+    Properties:
+      FileSystemType: WINDOWS
+      KmsKeyId: !Ref 'FSxKMSKey'
+      StorageCapacity: !Ref 'StorageCapacity'
+      SubnetIds:
+        - !Ref 'PrivateSubnet1'
+        - !Ref 'PrivateSubnet2'
+      SecurityGroupIds:
+        - !Ref 'FSxSecurityGroup'
+      Tags:
+        - Key: Name
+          Value: WindowsServerFSx
+        - Key: Network
+          Value: Private
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+      WindowsConfiguration:
+        ActiveDirectoryId: !Ref 'ManagedAD'
+        WeeklyMaintenanceStartTime: '7:15:00'
+        DailyAutomaticBackupStartTime: '18:00'
+        AutomaticBackupRetentionDays: 30
+        DeploymentType: MULTI_AZ_1
+        PreferredSubnetId: !Ref 'PrivateSubnet1'
+        ThroughputCapacity: !Ref 'ThroughputCapacity'
+  WorkspaceSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref WorkSpacesVPC
+      GroupDescription: Security Group for Workspaces
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: !Sub '0.0.0.0/0'
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: !Sub '10.${Octet}.16.0/21'
+  TransitGateway:
+    Type: "AWS::EC2::TransitGateway"
+    Condition: CreateVPNConnection
+    Properties:
+      AmazonSideAsn: 65001
+      Description: "AWS VPC to Transit Gateway"
+      AutoAcceptSharedAttachments: "enable"
+      DefaultRouteTableAssociation: "enable"
+      DnsSupport: "enable"
+      VpnEcmpSupport: "enable"
+      Tags:
+        - Key: Name
+          Value: VPCtoOnPremiseTransitGateway
+        - Key: Network
+          Value: Private
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+  TransitGatewayVPCAttachment:
+    Type: AWS::EC2::TransitGatewayAttachment
+    Condition: CreateVPNConnection
+    Properties:
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: TransitGatewayAttachmenttoWorkspaceVPC
+        - Key: Network
+          Value: Private
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref WorkSpacesVPC
+  PrivateRouteToTransitGatewayRoute1:
+    Type: 'AWS::EC2::Route'
+    Condition: CreateVPNConnection
+    DependsOn: TransitGatewayVPCAttachment
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: !Ref OnPremiseCIDR
+      TransitGatewayId: !Ref TransitGateway
+  CustomerGateway:
+    Type: AWS::EC2::CustomerGateway
+    Condition: CreateVPNConnection
+    Properties: 
+      Type: ipsec.1
+      BgpAsn: 65000
+      IpAddress: !Ref OnPremiseVPNTerminationIP
+      Tags:
+        - Key: Name
+          Value: OnPremiseCustomerGateway
+        - Key: Network
+          Value: Private
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+  VPN:
+    Type: AWS::EC2::VPNConnection
+    Condition: CreateVPNConnection
+    Properties:
+      CustomerGatewayId: !Ref CustomerGateway
+      StaticRoutesOnly: 'true'
+      TransitGatewayId: !Ref TransitGateway
+      Type: 'ipsec.1'
+      Tags:
+        - Key: Name
+          Value: WorkspaceProdSecondaryOnPremiseVPN
+        - Key: Network
+          Value: Private
+        - Key: CFNStackName
+          Value: !Ref AWS::StackName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: BusinessGroup
+          Value: !Ref BusinessGroup
+  # Internet Access
+  InternerAccessPrivateRoute:
+    Type: 'AWS::EC2::Route'
+    Condition: CreateInternetAccesstoWorkspace
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+  # Restricted Internet Access
+  CustomIPWhitelist1:
+    Type: 'AWS::EC2::Route'
+    Condition: CreateCustomIPWhitelisting
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: !Ref CustomIPAddress1
+      NatGatewayId: !Ref NatGateway
+  CustomIPWhitelist2:
+    Type: 'AWS::EC2::Route'
+    Condition: CreateCustomIPWhitelisting
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: !Ref CustomIPAddress2
+      NatGatewayId: !Ref NatGateway
+  # Section of the Cloudformation that gets constant update
+  # WorkspacesForGokulnathVenugopal:
+  #   Type: AWS::WorkSpaces::Workspace
+  #   Properties:
+  #     UserName: 'GokulnathVenugopal'
+  #     BundleId: !Ref 'BundleId'
+  #     DirectoryId: !Ref 'ManagedAD'
+  #     Tags:
+  #       - Key: Name
+  #         Value: Workspace
+  #       - Key: Network
+  #         Value: Private
+  #       - Key: CFNStackName
+  #         Value: !Ref AWS::StackName
+  #       - Key: CostCenter
+  #         Value: !Ref CostCenter
+  #       - Key: BusinessGroup
+  #         Value: !Ref BusinessGroup
+  #     WorkspaceProperties:
+  #       RunningMode: 'AUTO_STOP'
+  #       ComputeTypeName: 'POWER'
+  #       RootVolumeSizeGib: 80
+  #       UserVolumeSizeGib: 10
